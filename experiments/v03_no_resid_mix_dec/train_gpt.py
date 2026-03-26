@@ -623,15 +623,18 @@ class Block(nn.Module):
         layer_idx: int = 0,
         ln_scale: bool = False,
         dtg: bool = False,
+        use_resid_mix: bool = True,
     ):
         super().__init__()
+        self.use_resid_mix = use_resid_mix
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if use_resid_mix:
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
@@ -640,8 +643,11 @@ class Block(nn.Module):
         else:
             self.dtg_gate = None
     def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if self.use_resid_mix:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        else:
+            x_in = x
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
@@ -703,6 +709,7 @@ class GPT(nn.Module):
                     layer_idx=i,
                     ln_scale=ln_scale,
                     dtg=dtg,
+                    use_resid_mix=(i < self.num_encoder_layers),
                 )
                 for i in range(num_layers)
             ]

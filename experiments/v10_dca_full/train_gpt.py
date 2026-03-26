@@ -1,7 +1,17 @@
-# ─── Fork Changes (Ryan Hartman, 2026-03-24) ───────────────────────────────
-# Base: SOTA submission (signalrush, 1.1228 BPB, 2026-03-22)
-# Grep for [RH-P0x] to find individual changes.
+# ─── v10_dca_full — Full DCA with GRN-v3 on Block Input ──────────────────────
+# Fork of SOTA baseline (signalrush, 1.1228 BPB, 2026-03-22)
+# Replaces BOTH resid_mix AND skip_weights with GRN-v3 (dimension-dependent
+# + input-dependent gating) per IDEAS.md §12B (simpler variant).
 #
+# Changes vs baseline:
+# [v10-1] New GRN class: dimension-dependent b_t [dim, t] + input-dependent w_t [dim]
+# [v10-2] Block: remove resid_mix; forward takes (x, v_embed) not (x, x0, v_embed)
+# [v10-3] GPT: remove skip_weights, add GRN instances, pre-allocate layer stack buffer
+# [v10-4] GPT.forward() / forward_logits(): use GRN + layer stack
+# [v10-5] Optimizer: b_t (2D) → matrix_params (Muon), w_t + gate_bias (1D) → scalar_params
+# [v10-6] GRN init: encoder → favor previous layer; decoder → favor prev + skip pair
+#
+# Original baseline changes preserved:
 # [RH-P0a]   GPTQ-lite per-row fix — percentile search now tracks MSE per row (was per-matrix)
 # [RH-P0c]   Dead SWA removal — all swa_* hyperparams, state, and accumulation loop deleted
 # [RH-P0d]   Late QAT compile fix — two-phase compile (no-QAT + QAT) warmed up front;
@@ -256,7 +266,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,smear,dtg_gate,ve_layer_scales,ve_shared.scale,gate_bias",
     ).split(",")
     if pattern
 )
@@ -611,6 +621,38 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
+# [v10-1] Gated Residual Network v3 (dimension-dependent + input-dependent)
+class GRN(nn.Module):
+    """Computes a weighted combination of prior layer outputs.
+
+    For layer t with t prior outputs:
+      gate  = relu(einsum(x, w) + bias)   → [B, T, 1]  (input-dependent)
+      comb  = einsum(G_t, b)               → [B, T, D]  (dimension-dependent)
+      out   = gate * comb                  → [B, T, D]
+    """
+    def __init__(self, dim: int, num_prior_layers: int):
+        super().__init__()
+        self.num_prior_layers = num_prior_layers
+        if num_prior_layers > 0:
+            self.b = nn.Parameter(torch.zeros(dim, num_prior_layers, dtype=torch.float32))
+            self.w = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+            self.gate_bias = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+    def forward(self, layer_stack: Tensor, x_prev: Tensor) -> Tensor:
+        """
+        layer_stack: [num_layers_max, B, T, D] — pre-allocated buffer (only [:num_prior_layers] valid)
+        x_prev: [B, T, D] — previous layer output (for input-dependent gate)
+        """
+        if self.num_prior_layers == 0:
+            return x_prev
+        t = self.num_prior_layers
+        # Input-dependent gate: scalar per position
+        gate = torch.relu(
+            torch.einsum('btd,d->bt', x_prev, self.w.to(x_prev.dtype))
+            + self.gate_bias.to(x_prev.dtype)
+        ).unsqueeze(-1)  # [B, T, 1]
+        # Dimension-dependent weighted combination of prior layers
+        comb = torch.einsum('lbtd,dl->btd', layer_stack[:t], self.b[:, :t].to(x_prev.dtype))  # [B, T, D]
+        return gate * comb
 class Block(nn.Module):
     def __init__(
         self,
@@ -631,7 +673,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # [v10-2] resid_mix removed — replaced by GRN in GPT.forward()
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
@@ -639,9 +681,9 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
+        # [v10-2] x is already the GRN-composed input; no x0 mixing
+        x_in = x
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
@@ -689,8 +731,7 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # [v10-3] skip_weights removed — subsumed by GRN
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -707,6 +748,10 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        # [v10-3] One GRN per block. Block 0 has 0 prior layers.
+        self.grns = nn.ModuleList([GRN(model_dim, t) for t in range(num_layers)])
+        # [v10-6] Initialize GRN weights to replicate baseline behavior
+        self._init_grn_weights(num_layers, model_dim)
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
@@ -736,6 +781,29 @@ class GPT(nn.Module):
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
         self._init_weights()
+    def _init_grn_weights(self, num_layers: int, model_dim: int) -> None:
+        """[v10-6] Initialize GRN b weights to replicate baseline U-Net + residual behavior.
+        Encoder blocks: b[:, t-1] = 1.0 (favor immediately preceding layer).
+        Decoder blocks: b[:, t-1] = 1.0 (previous layer) + b[:, skip_src] = 1.0 (U-Net pair).
+        gate_bias initialized to 1.0 (relu(0+1)=1 → pass-through).
+        """
+        num_enc = self.num_encoder_layers  # 5 for 11 layers
+        num_dec = self.num_decoder_layers  # 6 for 11 layers
+        num_skip = min(num_enc, num_dec)   # 5
+        with torch.no_grad():
+            for t in range(num_layers):
+                if t == 0:
+                    continue  # Block 0 has 0 prior layers, no weights
+                grn = self.grns[t]
+                # Default: favor previous layer (standard residual connection)
+                grn.b[:, t - 1] = 1.0
+                # For decoder blocks with skip connections, also favor the U-Net pair
+                if t >= num_enc:
+                    dec_idx = t - num_enc  # 0-indexed decoder position
+                    if dec_idx < num_skip:
+                        # U-Net pairs: decoder 0 ↔ encoder 4, decoder 1 ↔ encoder 3, etc.
+                        skip_src = num_enc - 1 - dec_idx
+                        grn.b[:, skip_src] = 1.0
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -765,18 +833,22 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        skips: list[Tensor] = []
+        # [v10-4] Pre-allocate layer stack buffer for torch.compile (no dynamic shapes)
+        num_layers = len(self.blocks)
+        B, T, D = x.shape
+        layer_stack = torch.zeros(num_layers, B, T, D, device=x.device, dtype=x.dtype)
         ve_cache: dict = {}
-        for i in range(self.num_encoder_layers):
+        x_prev = x0  # current "latest" output for GRN's input-dependent gate
+        for i in range(num_layers):
+            if i == 0:
+                x_in = x0  # Block 0 has no prior layers
+            else:
+                # GRN composes block input from all prior layer outputs
+                x_in = self.grns[i](layer_stack, x_prev)
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            x = self.blocks[i](x_in, v_embed=ve)
+            layer_stack[i] = x
+            x_prev = x
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -813,18 +885,21 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        skips: list[Tensor] = []
+        # [v10-4] Same GRN + layer stack logic as forward()
+        num_layers = len(self.blocks)
+        B, T, D = x.shape
+        layer_stack = torch.zeros(num_layers, B, T, D, device=x.device, dtype=x.dtype)
         ve_cache: dict = {}
-        for i in range(self.num_encoder_layers):
+        x_prev = x0
+        for i in range(num_layers):
+            if i == 0:
+                x_in = x0
+            else:
+                x_in = self.grns[i](layer_stack, x_prev)
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            x = self.blocks[i](x_in, v_embed=ve)
+            layer_stack[i] = x
+            x_prev = x
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1127,8 +1202,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    # [v10-5] skip_weights removed; add GRN params to correct optimizer groups
+    # GRN b matrices (2D) → matrix_params (Muon); w vectors + gate_bias (1D/0D) → scalar_params
+    for grn in base_model.grns:
+        if grn.num_prior_layers > 0:
+            matrix_params.append(grn.b)
+            scalar_params.append(grn.w)
+            scalar_params.append(grn.gate_bias)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)

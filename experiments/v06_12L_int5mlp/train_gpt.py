@@ -2,6 +2,12 @@
 # Base: SOTA submission (signalrush, 1.1228 BPB, 2026-03-22)
 # Grep for [RH-P0x] to find individual changes.
 #
+# ─── v06: 12-Layer + Int5 MLP Fork ─────────────────────────────────────────
+# [v06-1]  NUM_LAYERS: 11 → 12 (U-Net becomes 6+6, skip_weights[6,512])
+# [v06-2]  VE_LAYERS: "9,10" → "10,11" (shift to last two layers)
+# [v06-3]  Int5 MLP export: mixed_quantize_int6() uses clip_range=15 for MLP
+# [v06-4]  Int5 MLP QAT: _clip_range=15 set on all MLP CastedLinear modules
+#
 # [RH-P0a]   GPTQ-lite per-row fix — percentile search now tracks MSE per row (was per-matrix)
 # [RH-P0c]   Dead SWA removal — all swa_* hyperparams, state, and accumulation loop deleted
 # [RH-P0d]   Late QAT compile fix — two-phase compile (no-QAT + QAT) warmed up front;
@@ -58,7 +64,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 12))  # [v06-1] 11 → 12
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -96,7 +102,7 @@ class Hyperparameters:
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
-    ve_layers = os.environ.get("VE_LAYERS", "9,10")
+    ve_layers = os.environ.get("VE_LAYERS", "10,11")  # [v06-2] shift to last two layers
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -735,6 +741,11 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # [v06-4] Int5 MLP QAT: set _clip_range=15 on all CastedLinear modules in MLP
+        for block in self.blocks:
+            for m in block.mlp.modules():
+                if isinstance(m, CastedLinear):
+                    m._clip_range = 15
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -953,7 +964,9 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t)
+            # [v06-3] Int5 MLP export: clip_range=15 for MLP, 31 for attn
+            cr = 15 if cat == "mlp" else 31
+            q, s = quantize_int6_per_row(t, clip_range=cr)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}

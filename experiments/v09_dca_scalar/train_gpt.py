@@ -1,7 +1,17 @@
-# ─── Fork Changes (Ryan Hartman, 2026-03-24) ───────────────────────────────
-# Base: SOTA submission (signalrush, 1.1228 BPB, 2026-03-22)
-# Grep for [RH-P0x] to find individual changes.
+# ─── v09_dca_scalar — DCA GRN-v1: Scalar Residual Weights ────────────────────
+# Fork of SOTA baseline (signalrush, 1.1228 BPB, 2026-03-22)
+# Replaces resid_mix with learnable scalar weights over prior layer outputs
+# per IDEAS.md §12A (DenseFormer-style).
 #
+# Changes vs baseline:
+# [v09-1] Block: remove resid_mix param; forward takes (x, v_embed) not (x, x0, v_embed)
+# [v09-2] GPT: add dca_weights ParameterList (55 scalar params total)
+# [v09-3] GPT.forward() / forward_logits(): maintain layer output buffer,
+#          compute softmax-weighted combo before each block
+# [v09-4] Keep U-Net skip_weights — only resid_mix is replaced
+# [v09-5] Optimizer: dca_weights → scalar_params (AdamW, fp32)
+#
+# Original baseline changes preserved:
 # [RH-P0a]   GPTQ-lite per-row fix — percentile search now tracks MSE per row (was per-matrix)
 # [RH-P0c]   Dead SWA removal — all swa_* hyperparams, state, and accumulation loop deleted
 # [RH-P0d]   Late QAT compile fix — two-phase compile (no-QAT + QAT) warmed up front;
@@ -256,7 +266,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,dca_weight",
     ).split(",")
     if pattern
 )
@@ -631,7 +641,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # [v09-1] resid_mix removed — replaced by DCA scalar weights in GPT.forward()
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
@@ -639,9 +649,9 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
+        # [v09-1] x is already the DCA-composed input; no x0 mixing needed
+        x_in = x
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
@@ -707,6 +717,19 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        # [v09-2] DCA scalar weights: block t has t weights over prior layer outputs
+        # Total: sum(1..num_layers-1) = num_layers*(num_layers-1)/2 = 55 for 11 layers
+        self.dca_weights = nn.ParameterList()
+        for t in range(num_layers):
+            if t == 0:
+                # Block 0 has no prior layers — placeholder (unused)
+                self.dca_weights.append(nn.Parameter(torch.zeros(1, dtype=torch.float32)))
+            else:
+                # Initialize: last weight = 1.0, others = 0.0
+                # softmax will favor the immediately preceding layer
+                w = torch.zeros(t, dtype=torch.float32)
+                w[-1] = 1.0
+                self.dca_weights.append(nn.Parameter(w))
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
@@ -765,18 +788,38 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
+        # [v09-3] DCA: maintain layer output buffer for weighted combinations
+        num_layers = len(self.blocks)
+        B, T, D = x.shape
+        layer_buf = torch.zeros(num_layers, B, T, D, device=x.device, dtype=x.dtype)
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            if i == 0:
+                x_in = x0  # Block 0: no prior layers, use embedding directly
+            else:
+                # Softmax-weighted combination of prior layer outputs
+                w = F.softmax(self.dca_weights[i], dim=0)  # [i]
+                x_in = torch.zeros_like(x0)
+                for j in range(i):
+                    x_in = x_in + w[j] * layer_buf[j]
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            x = self.blocks[i](x_in, v_embed=ve)
+            layer_buf[i] = x
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
+            # DCA: weighted combination of all prior layer outputs
+            w = F.softmax(self.dca_weights[bi], dim=0)  # [bi]
+            x_in = torch.zeros_like(x0)
+            for j in range(bi):
+                x_in = x_in + w[j] * layer_buf[j]
+            # [v09-4] Keep U-Net skip connections
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x_in = x_in + self.skip_weights[i].to(dtype=x_in.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            x = self.blocks[bi](x_in, v_embed=ve)
+            layer_buf[bi] = x
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -813,18 +856,35 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
+        # [v09-3] DCA: same layer output buffer logic as forward()
+        num_layers = len(self.blocks)
+        B, T, D = x.shape
+        layer_buf = torch.zeros(num_layers, B, T, D, device=x.device, dtype=x.dtype)
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            if i == 0:
+                x_in = x0
+            else:
+                w = F.softmax(self.dca_weights[i], dim=0)
+                x_in = torch.zeros_like(x0)
+                for j in range(i):
+                    x_in = x_in + w[j] * layer_buf[j]
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            x = self.blocks[i](x_in, v_embed=ve)
+            layer_buf[i] = x
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
+            w = F.softmax(self.dca_weights[bi], dim=0)
+            x_in = torch.zeros_like(x0)
+            for j in range(bi):
+                x_in = x_in + w[j] * layer_buf[j]
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x_in = x_in + self.skip_weights[i].to(dtype=x_in.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            x = self.blocks[bi](x_in, v_embed=ve)
+            layer_buf[bi] = x
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1130,6 +1190,10 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
+    # [v09-5] DCA weights → scalar_params (AdamW, fp32). Skip block 0 placeholder.
+    for t, dca_w in enumerate(base_model.dca_weights):
+        if t > 0:
+            scalar_params.append(dca_w)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr

@@ -2,6 +2,11 @@
 # Base: SOTA submission (signalrush, 1.1228 BPB, 2026-03-22)
 # Grep for [RH-P0x] to find individual changes.
 #
+# ─── v07: U-Shaped Layerwise Quantization Fork ────────────────────────────
+# [v07-1]  _get_clip_range(): layerwise precision grid from IDEAS.md §1E
+# [v07-2]  mixed_quantize_int6(): extracts layer_idx, uses clip range grid
+# [v07-3]  Per-module _clip_range in GPT.__init__() for QAT alignment
+#
 # [RH-P0a]   GPTQ-lite per-row fix — percentile search now tracks MSE per row (was per-matrix)
 # [RH-P0c]   Dead SWA removal — all swa_* hyperparams, state, and accumulation loop deleted
 # [RH-P0d]   Late QAT compile fix — two-phase compile (no-QAT + QAT) warmed up front;
@@ -20,6 +25,7 @@ import io
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -735,6 +741,18 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # [v07-3] U-shaped precision: set per-module _clip_range for QAT alignment
+        for i, block in enumerate(self.blocks):
+            # Attention modules
+            for attr in ("c_q", "c_k", "c_v", "proj"):
+                m = getattr(block.attn, attr)
+                fake_name = f"blocks.{i}.attn.{attr}.weight"
+                m._clip_range = _get_clip_range(fake_name, i, "attn")
+            # MLP modules
+            block.mlp.fc._clip_range = _get_clip_range(
+                f"blocks.{i}.mlp.fc.weight", i, "mlp")
+            block.mlp.proj._clip_range = _get_clip_range(
+                f"blocks.{i}.mlp.proj.weight", i, "mlp")
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -938,6 +956,22 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
+# [v07-1] U-shaped layerwise precision grid (IDEAS.md §1E)
+def _extract_layer_idx(name: str) -> int | None:
+    m = re.match(r"blocks\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+def _get_clip_range(name: str, layer_idx: int | None, cat: str) -> int:
+    if layer_idx is None:
+        return 31  # non-layer params
+    if 3 <= layer_idx <= 7:  # middle zone
+        if cat == "attn": return 15   # int5 attention
+        if cat == "mlp" and ".fc." in name: return 7  # int4 MLP fc
+        if cat == "mlp": return 15    # int5 MLP proj
+    if layer_idx >= 8:  # late zone
+        if cat == "attn": return 127  # int8 attention
+        if cat == "mlp" and ".proj." in name: return 31  # int6 MLP proj
+        if cat == "mlp": return 15    # int5 MLP fc
+    return 31 if cat == "attn" else 15  # early: int6 attn, int5 MLP
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
@@ -953,7 +987,10 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t)
+            # [v07-2] Layerwise clip range from U-shaped grid
+            layer_idx = _extract_layer_idx(name)
+            cr = _get_clip_range(name, layer_idx, cat)
+            q, s = quantize_int6_per_row(t, clip_range=cr)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}

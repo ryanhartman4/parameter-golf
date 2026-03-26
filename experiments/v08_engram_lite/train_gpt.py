@@ -1,7 +1,14 @@
-# ─── Fork Changes (Ryan Hartman, 2026-03-24) ───────────────────────────────
-# Base: SOTA submission (signalrush, 1.1228 BPB, 2026-03-22)
-# Grep for [RH-P0x] to find individual changes.
+# ─── v08_engram_lite — Engram-Lite: Gated BigramHash ─────────────────────────
+# Fork of SOTA baseline (signalrush, 1.1228 BPB, 2026-03-22)
+# Adds context-aware gating to BigramHashEmbedding per IDEAS.md §11A.
 #
+# Changes vs baseline:
+# [v08-1] BigramHashEmbedding: add gate_k, gate_q, gate_norm_h, gate_norm_k
+# [v08-2] BigramHashEmbedding.forward(): accept hidden state h, compute gated output
+# [v08-3] GPT.forward() / forward_logits(): pass token embedding x as h to bigram
+# [v08-4] Optimizer: gate_k.weight, gate_q.weight → matrix_params (Muon)
+#
+# Original baseline changes preserved:
 # [RH-P0a]   GPTQ-lite per-row fix — percentile search now tracks MSE per row (was per-matrix)
 # [RH-P0c]   Dead SWA removal — all swa_* hyperparams, state, and accumulation loop deleted
 # [RH-P0d]   Late QAT compile fix — two-phase compile (no-QAT + QAT) warmed up front;
@@ -567,12 +574,24 @@ class BigramHashEmbedding(nn.Module):
     def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
         super().__init__()
         self.bigram_vocab_size = bigram_vocab_size
+        self.bigram_dim = bigram_dim
         self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
         nn.init.zeros_(self.embed.weight)
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
         self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+        # [v08-1] Context-aware gating (Engram-lite, IDEAS.md §11A)
+        self.gate_k = CastedLinear(bigram_dim, bigram_dim, bias=False)
+        # Initialize gate_k to identity-like with small scale → near pass-through
+        with torch.no_grad():
+            nn.init.eye_(self.gate_k.weight)
+            self.gate_k.weight.mul_(0.01)
+        # Project hidden state from model_dim to bigram_dim for gating dot product
+        self.gate_q = CastedLinear(model_dim, bigram_dim, bias=False)
+        nn.init.zeros_(self.gate_q.weight)  # gate starts at sigmoid(0)=0.5
+        self.gate_norm_h = RMSNorm()
+        self.gate_norm_k = RMSNorm()
     def bigram_hash(self, tokens: Tensor) -> Tensor:
         t = tokens.to(torch.int32)
         mod = self.bigram_vocab_size - 1
@@ -580,11 +599,22 @@ class BigramHashEmbedding(nn.Module):
         out[..., 0] = mod
         out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
         return out.long()
-    def forward(self, token_ids: Tensor) -> Tensor:
-        h = self.embed(self.bigram_hash(token_ids))
+    def forward(self, token_ids: Tensor, h: Tensor | None = None) -> Tensor:
+        embed_out = self.embed(self.bigram_hash(token_ids))  # [B, T, bigram_dim]
+        if h is not None:
+            # [v08-2] Context-aware gating: gate = sigmoid(q·k / sqrt(d))
+            q = self.gate_q(self.gate_norm_h(h))                   # [B, T, bigram_dim]
+            k = self.gate_norm_k(self.gate_k(embed_out))            # [B, T, bigram_dim]
+            gate = torch.sigmoid(
+                (q * k).sum(dim=-1, keepdim=True) / math.sqrt(self.bigram_dim)
+            )                                                        # [B, T, 1]
+            if self.proj is not None:
+                embed_out = self.proj(embed_out)
+            return gate * embed_out * self.scale.to(dtype=embed_out.dtype)
+        # Fallback (no hidden state) — original behavior
         if self.proj is not None:
-            h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
+            embed_out = self.proj(embed_out)
+        return embed_out * self.scale.to(dtype=embed_out.dtype)
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
     Each table maps vocab tokens to a low-dim embedding, projected to model_dim."""
@@ -736,6 +766,12 @@ class GPT(nn.Module):
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
         self._init_weights()
+        # [v08-1] Re-apply gating inits AFTER _init_weights() which overwrites with orthogonal
+        if self.bigram is not None:
+            with torch.no_grad():
+                nn.init.eye_(self.bigram.gate_k.weight)
+                self.bigram.gate_k.weight.mul_(0.01)
+                self.bigram.gate_q.weight.zero_()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -761,7 +797,7 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
-            x = x + self.bigram(input_ids)
+            x = x + self.bigram(input_ids, h=x)  # [v08-3] pass token embedding as h
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -809,7 +845,7 @@ class GPT(nn.Module):
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
-            x = x + self.bigram(input_ids)
+            x = x + self.bigram(input_ids, h=x)  # [v08-3] pass token embedding as h
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1132,6 +1168,9 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+        # [v08-4] gate_k is 2D → matrix_params (Muon); gate_q is 2D → matrix_params (Muon)
+        matrix_params.append(base_model.bigram.gate_k.weight)
+        matrix_params.append(base_model.bigram.gate_q.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:

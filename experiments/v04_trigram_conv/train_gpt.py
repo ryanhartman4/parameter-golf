@@ -555,14 +555,20 @@ class CausalSelfAttention(nn.Module):
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
-class SmearGate(nn.Module):
+class TrigramConv(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.conv = nn.Conv1d(dim, dim, kernel_size=3, padding=0, groups=dim, bias=False)
+        # Identity-init: center tap = 1.0, side taps = 0.0
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.weight[:, 0, 2] = 1.0  # current-position tap (index 2 with left-pad-by-2)
     def forward(self, x: Tensor) -> Tensor:
-        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
-        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
-        return (1 - g) * x + g * x_prev
+        # x: [B, T, D] → transpose → causal left-pad by 2 → conv → transpose back
+        xt = x.transpose(1, 2)           # [B, D, T]
+        xt = F.pad(xt, (2, 0))           # left-pad only (causal)
+        xt = self.conv(xt)               # [B, D, T]
+        return xt.transpose(1, 2)        # [B, T, D]
 class BigramHashEmbedding(nn.Module):
     def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
         super().__init__()
@@ -686,7 +692,7 @@ class GPT(nn.Module):
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.smear = SmearGate(model_dim)
+        self.smear = TrigramConv(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1129,7 +1135,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.smear.gate)
+    scalar_params.append(base_model.smear.conv.weight)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
