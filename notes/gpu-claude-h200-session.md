@@ -39,3 +39,10 @@
 - No prebuilt wheel exists for FA3 Hopper
 - Full build = 451 CUDA kernel files, would take 3-4 hours
 - Solved by disabling unnecessary hdim/dtype variants (451 → 4 files, built in ~5 min)
+
+## Recommendations Going Forward
+
+1. **Skip the heavy evals** — eval_stride32 and eval_recurrence should run after training, not block the queue. Or skip entirely on 1xH200 and save for 8xH100.
+2. **Increase wallclock or reduce variants** — 700 steps isn't enough to differentiate subtle changes. Either run fewer variants with more steps, or move to 8xH100.
+3. **Prioritize high-signal experiments** — v06 (12L), v09/v10 (DCA), and v01 (XSA all) are the most likely to show clear deltas even at low step counts.
+4. **The real validation needs 8xH100** — this setup is useful for catching obvious failures but can't reliably identify winners at the <0.01 BPB level.
