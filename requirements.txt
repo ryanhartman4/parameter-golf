@@ -8,3 +8,5 @@ typing-extensions==4.15.0
 datasets
 tiktoken
 sentencepiece
+brotli
+# GPU-only: pip install flash_attn_3 --no-deps --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/
